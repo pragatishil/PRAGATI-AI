@@ -1,5 +1,6 @@
 .gitattributes
 .gitignore
+LICENSE
 README.md
 archive/notebook_cell_exports/cell_00.py.txt
 archive/notebook_cell_exports/cell_01.py.txt
@@ -25,13 +26,9 @@ data/calibration/curve_residuals_v10.pkl
 data/manifests/__huggingface_repos__.json
 data/processed/coffee/coffee_sequences_v10.csv
 data/processed/coffee/coffee_v10.csv
-data/processed/coffee_sequences_v10.csv
-data/processed/coffee_v10.csv
 data/processed/gsev_model_v10.pkl
 data/processed/prognosis/prognosis_classes_v10.pkl
 data/processed/prognosis/prognosis_master.csv
-data/processed/prognosis_classes_v10.pkl
-data/processed/prognosis_master.csv
 data/processed/test_sequences_v10.csv
 data/processed/test_v10.csv
 data/processed/train_sequences_v10.csv
@@ -151,6 +148,7 @@ models/proposed/best_prognosis_net_v10_seed42.pth
 models/proposed/best_prognosis_net_v10_seed777.pth
 models/proposed/best_prognosis_net_v10_seed999.pth
 notebooks/version-v10.ipynb
+repository_files.txt
 requirements.txt
 results/README.md
 results/analysis/attention_sample_trajectories.png
