@@ -1,107 +1,337 @@
-# PRAGATI-AI v10 — Reproducibility Repository
+# PRAGATI-AI
 
-**Manuscript:** *Weakly Supervised Pseudo-Temporal Forecasting of Crop Disease Progression from Static Plant Imagery*
+## Pseudo-Temporal Agricultural Disease Prognosis from Static Imagery
 
-This repository is an organized working repository built from the supplied `version-v10.ipynb`.
+PRAGATI-AI is a research framework for agricultural disease analysis and prognosis using computer vision, ordinal severity modelling, pseudo-temporal sequence construction, and uncertainty-aware forecasting.
 
-## Important status
+The repository contains the code, processed research artifacts, trained models, evaluation results, figures, and reproducibility metadata associated with the PRAGATI-AI research workflow.
 
-This is the **complete repository scaffold / consolidation point** for v10. It intentionally preserves the supplied notebook logic rather than silently refactoring or changing the research implementation.
+> **Research status:** This repository contains research-stage implementations and experimental results. Reported results should be interpreted in the context of the accompanying datasets, experimental configuration, and reproducibility documentation.
 
-The repository is designed so that generated artifacts can be moved into a single location first. After consolidation, we can decide what should be:
-- retained as public reproducibility material,
-- archived,
-- excluded because it is an intermediate/debug artifact,
-- or linked to an external dataset/repository.
+---
 
-## Current organization
+## Overview
+
+PRAGATI-AI investigates whether disease progression information can be approximated from collections of static agricultural images by constructing pseudo-temporal severity sequences.
+
+The V10 workflow combines:
+
+* visual representation learning;
+* ordinal disease-severity modelling;
+* composite severity estimation;
+* pseudo-temporal sequence construction;
+* temporal prognosis modelling;
+* attention-based forecasting;
+* monotonicity constraints;
+* uncertainty estimation;
+* conformal prediction;
+* baseline comparison;
+* ablation analysis;
+* robustness evaluation.
+
+The primary prognosis experiments forecast disease severity over multiple future pseudo-temporal steps.
+
+---
+
+## Repository Structure
 
 ```text
-PRAGATI-AI-v10-repository/
-├── notebooks/
-│   └── version-v10.ipynb
-├── scripts/
-│   ├── 00_prognosis_master_builder_v10.py
-│   ├── 01_research_grade_v10.py
-│   ├── 02_prognosisnet_v10.py
-│   ├── 03_coffee_sequence_builder_v10.py
-│   ├── 04_cross_domain_coffee_evaluation.py
-│   ├── 05_baselines_ablations_v10.py
-│   ├── 06_elsevier_figure_generation.py
-│   └── 07_inventory_dataset_files.py
+PRAGATI-AI/
+│
+├── archive/
+│   └── notebook_cell_exports/
+│
+├── configs/
+│
 ├── data/
-│   ├── raw/
+│   ├── calibration/
 │   ├── processed/
-│   └── manifests/
+│   │   ├── coffee/
+│   │   └── prognosis/
+│   └── representations/
+│
+├── docs/
+│
+├── figures/
+│   ├── eda/
+│   └── manuscript/
+│
+├── metadata/
+│
 ├── models/
-│   └── checkpoints/
+│   ├── ablations/
+│   ├── baselines/
+│   ├── core/
+│   └── proposed/
+│
+├── notebooks/
+│
 ├── results/
-│   ├── tables/
+│   ├── analysis/
+│   ├── calibration/
 │   ├── metrics/
 │   ├── predictions/
-│   ├── calibration/
-│   ├── robustness/
-│   └── analysis/
-├── figures/
-│   ├── elsevier/
-│   └── eda/
-├── configs/
-├── docs/
-└── archive/
-    └── notebook_cell_exports/
+│   ├── representations/
+│   └── tables/
+│
+├── scripts/
+│
+├── README.md
+├── LICENSE
+├── requirements.txt
+└── .gitignore
 ```
 
-## Pipeline represented by v10
+---
 
-1. Build the prognosis master dataset and severity/quality reports.
-2. Perform research-grade visual representation, morphology, CORAL, severity modelling and pseudo-temporal sequence construction.
-3. Train/evaluate the prognosis network and uncertainty/calibration components.
-4. Build the held-out coffee sequence dataset.
-5. Perform cross-domain evaluation.
-6. Run baseline comparisons and ablations.
-7. Generate Elsevier figures, graphical abstract, highlights, captions and checklist.
-8. Inventory the complete generated dataset/file collection.
+## V10 Experimental Pipeline
 
-## Source datasets
+The V10 prognosis workflow can be summarized as:
 
-The original external datasets should **not be copied into this repository unless their licenses explicitly permit redistribution**.
+```text
+Agricultural Images
+        │
+        ▼
+Visual Representation Learning
+        │
+        ▼
+Composite Disease Severity
+        │
+        ▼
+Pseudo-Temporal Sequence Construction
+        │
+        ▼
+Prognosis Network
+        │
+        ├── Temporal modelling
+        ├── Attention
+        ├── Visual-delta information
+        └── Monotonicity constraints
+        │
+        ▼
+Multi-step Severity Forecast
+        │
+        ├── t+1
+        ├── t+2
+        └── t+3
+        │
+        ▼
+Uncertainty Quantification
+        │
+        ▼
+Conformal Prediction
+```
 
-The supplied manuscript identifies:
-- PlantSeg
-- Rice leaf disease dataset
-- Field-acquired Plant Disease Dataset / Kaggle
+---
 
-The `data/` directory is therefore reserved for manifests, preprocessing outputs, split definitions and documentation unless redistribution rights are confirmed.
+## Main V10 Components
 
-## Reproducibility materials
+### Prognosis
 
-The final repository should eventually contain, where appropriate:
-- source code,
-- environment specification,
-- configuration files,
-- dataset acquisition instructions,
-- preprocessing/split manifests,
-- final model checkpoints,
-- reported predictions,
-- CSV files underlying manuscript tables,
-- calibration/robustness outputs,
-- figure-generation code and final figures,
-- documentation describing how each manuscript table/figure is reproduced.
+The V10 prognosis implementation is primarily contained in:
 
-## v10 paths
+```text
+scripts/00_prognosis_master_builder_v10.py
+scripts/01_research_grade_v10.py
+scripts/02_prognosisnet_v10.py
+```
 
-The supplied notebook currently uses Kaggle-specific paths such as `/kaggle/input/...` and `/kaggle/working/...`.
+### Cross-domain evaluation
 
-**Do not refactor these paths yet.** First consolidate all generated artifacts. Then we can make a clean, platform-independent configuration layer without changing the scientific pipeline.
+```text
+scripts/03_coffee_sequence_builder_v10.py
+scripts/04_cross_domain_coffee_evaluation.py
+```
 
-## Next consolidation step
+### Baselines and ablations
 
-Place the generated v10 files into this repository using the folders above. Then audit every file and classify it as:
+```text
+scripts/05_baselines_ablations_v10.py
+```
 
-**PUBLIC / ARCHIVE / REMOVE / EXTERNAL-LINK / REQUIRES-LICENSE-CHECK**
+### Figure generation
 
-Only after that should we create the final GitHub/Zenodo release.
+```text
+scripts/06_elsevier_figure_generation.py
+```
+
+### Dataset inventory
+
+```text
+scripts/07_inventory_dataset_files.py
+```
+
+---
+
+## Models
+
+The repository contains V10 checkpoints for:
+
+* the visual model;
+* severity modelling;
+* CORAL-based ordinal modelling;
+* prognosis modelling;
+* baseline architectures;
+* ablation configurations.
+
+Model checkpoints are organized under:
+
+```text
+models/core/
+models/proposed/
+models/baselines/
+models/ablations/
+```
+
+---
+
+## Results
+
+V10 evaluation outputs are organized under:
+
+```text
+results/metrics/
+results/predictions/
+results/analysis/
+results/calibration/
+results/tables/
+```
+
+Important prognosis outputs include:
+
+```text
+results/metrics/prognosis_metrics_v10.csv
+results/metrics/robustness_metrics_v10.csv
+results/analysis/prognosis_train_log_v10.csv
+results/predictions/predictions_test_v10.csv
+results/predictions/predictions_val_v10.csv
+```
+
+The repository also contains calibration artifacts, representations, analysis files, and manuscript tables.
+
+---
+
+## Reproducibility
+
+Reproducibility information is maintained in:
+
+```text
+docs/reproducibility.md
+metadata/CHECKPOINT_MANIFEST.csv
+metadata/FILE_HASHES_SHA256.csv
+requirements.txt
+```
+
+The V10 repository also contains the original research notebook:
+
+```text
+notebooks/version-v10.ipynb
+```
+
+and archived notebook-cell exports under:
+
+```text
+archive/notebook_cell_exports/
+```
+
+Where applicable, SHA-256 hashes are provided for important research artifacts.
+
+---
+
+## Important Note on Data and Models
+
+The repository contains research datasets, derived data, trained model checkpoints, and other experimental artifacts.
+
+The MIT License applies to the original code and other material for which the repository authors hold the necessary rights. Third-party datasets, pretrained models, imagery, or other externally sourced material may be subject to their own licenses and terms.
+
+Users are responsible for checking the applicable terms before redistributing or using third-party material.
+
+---
+
+## Installation
+
+Create a Python environment and install the required dependencies:
+
+```bash
+python -m venv .venv
+```
+
+Windows:
+
+```bat
+.venv\Scripts\activate
+```
+
+Linux/macOS:
+
+```bash
+source .venv/bin/activate
+```
+
+Then:
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## Research Reproduction
+
+The V10 workflow is organized into numbered scripts so that the major stages can be identified from the repository:
+
+```text
+00  → master/processed data construction
+01  → research-grade processing/training workflow
+02  → prognosis network
+03  → cross-domain sequence construction
+04  → cross-domain evaluation
+05  → baselines and ablations
+06  → manuscript figure generation
+07  → dataset inventory
+```
+
+For detailed experimental provenance and artifact relationships, see:
+
+```text
+docs/reproducibility.md
+```
+
+---
+
+## Figures
+
+Manuscript and exploratory figures are stored under:
+
+```text
+figures/eda/
+figures/manuscript/
+```
+
+Generated analysis figures are also available under:
+
+```text
+results/analysis/
+```
+
+---
+
+## Citation
+
+If this repository is used in academic work, please cite the associated publication once the manuscript is publicly available.
+
+A formal citation will be added here when the publication record is established.
+
+---
 
 ## License
 
-No license has been selected yet. Choose one deliberately before public release.
+This project is licensed under the MIT License. See [`LICENSE`](LICENSE) for the full license text.
+
+---
+
+## Status
+
+**Current research checkpoint:** V10
+
+The V10 checkpoint is preserved in Git history and is intended to provide a reproducible reference state for subsequent research development.
