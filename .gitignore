@@ -14,8 +14,8 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Large model/data artifacts — review before committing
-*.pth
+# Large model/data artifacts
+# .pth files are tracked through Git LFS.
 *.pt
 *.ckpt
 *.h5

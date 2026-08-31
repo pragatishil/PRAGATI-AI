@@ -1,0 +1,4 @@
+split,accuracy,macro_f1,top5
+val,0.8712,0.8463,0.9957
+test,0.8529,0.8396,0.9979
+coffee_interdom,0.0,0.0,0.0

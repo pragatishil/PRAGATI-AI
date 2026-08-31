@@ -1,0 +1,2 @@
+*.pth filter=lfs diff=lfs merge=lfs -text
+data/processed/train_sequences_v10.csv filter=lfs diff=lfs merge=lfs -text
