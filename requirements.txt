@@ -1,0 +1,16 @@
+# Initial dependency inventory inferred from version-v10.ipynb.
+# Pin exact versions after the final runtime environment is confirmed.
+
+numpy
+pandas
+opencv-python
+scipy
+scikit-learn
+matplotlib
+seaborn
+tqdm
+torch
+torchvision
+timm
+albumentations
+statsmodels

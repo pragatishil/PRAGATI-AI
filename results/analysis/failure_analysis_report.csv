@@ -1,0 +1,27 @@
+--- FAILURE ANALYSIS BY SEVERITY STAGE ---
+,Count,Count,Mean_MAE,Mean_MAE
+Error_Type,Over-predicted,Under-predicted,Over-predicted,Under-predicted
+Severity_Stage,,,,
+L0,0,0,,
+L1,0,0,,
+L2,48,25,0.018643174107031275,0.013914217120036482
+L3,18,138,0.009651477112331323,0.020335919978316415
+L4,0,0,,
+L5,0,0,,
+
+--- TOP 10% FAILURE CASES BY CLASS ---
+crop_disease,Over-predicted,Under-predicted,Total_Failures
+rice_brown_spot,2,2,4
+soybean_bacterial_blight,0,3,3
+squash_powdery_mildew,0,3,3
+rice_blast,2,0,2
+cabbage_downy_mildew,0,2,2
+cucumber_powdery_mildew,0,1,1
+potato_late_blight,0,1,1
+potato_early_blight,0,1,1
+lettuce_downy_mildew,0,1,1
+garlic_rust,0,1,1
+soybean_downy_mildew,0,1,1
+soybean_frog_eye_leafspot,0,1,1
+tomato_septoria_leafspot,0,1,1
+zucchini_powdery_mildew,0,1,1

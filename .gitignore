@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Large model/data artifacts — review before committing
+*.pth
+*.pt
+*.ckpt
+*.h5
+
+# Local/runtime paths
+/kaggle/
+/content/
+
+# Temporary outputs
+tmp/
+temp/
+logs/

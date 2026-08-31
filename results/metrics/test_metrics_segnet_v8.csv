@@ -1,0 +1,2 @@
+train_min,dice,iou,recall,precision,accuracy,mcc,hd95
+545.4,0.7934,0.7026,0.8227,0.8217,0.9535,0.638,66.6531

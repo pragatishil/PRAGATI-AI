@@ -1,0 +1,8 @@
+Model,MAE_Mild,MAE_Mod,MAE_Sev
+Proposed,—,0.018,—
+MLP Regression,—,0.028,—
+CNN-Emb + LSTM,—,0.026,—
+CNN-Emb + GRU,—,0.024,—
+TCN,—,0.026,—
+Transformer Enc.,—,0.026,—
+No Temporal Mdl,—,0.023,—

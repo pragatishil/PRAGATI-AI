@@ -1,0 +1,833 @@
+#!/usr/bin/env python3
+"""
+================================================================
+AGRO-DOCTOR (KRISHI-AI) — PART 3: PROGNOSISNET V10.1
+================================================================
+V10.1 TARGETED FIXES
+─────────────────────
+  FIX 1: Removed hard monotonic correction from evaluation.
+         The model must now learn monotonicity naturally via
+         the TCR loss, providing a scientifically sound metric.
+  FIX 2: Compressed vis_delta before concatenation.
+         Projected 512 -> 128 dims using LayerNorm + GELU.
+         Reduces noise and stabilizes temporal learning.
+
+V10 CHANGES FROM V9
+─────────────────────
+  C1  Visual delta embeddings.
+      vis_delta[t] = vis[t] - vis[t-1]  (zeros at t=0).
+      Concatenated into sequence features alongside vis.
+      Justification: disease progression is fundamentally
+      visual evolution, not just scalar severity change.
+
+  C2  Temporal masking augmentation (training only).
+      With probability 0.3, one random timestep has its
+      vis and morph features zeroed. Improves robustness.
+
+  C4  Uncertainty calibration metrics.
+      ECE (Expected Calibration Error), uncertainty-error
+      correlation, and coverage-width tradeoff added to
+      evaluate(). Strengthens uncertainty claims.
+
+  C5  Robustness evaluation.
+      evaluate_robustness() tests model under corruption.
+================================================================
+"""
+
+import os, random, copy, math, warnings, pickle, time
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from scipy.stats import spearmanr
+
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+warnings.filterwarnings("ignore")
+SEED=42; random.seed(SEED); np.random.seed(SEED)
+torch.manual_seed(SEED); torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic=True; torch.backends.cudnn.benchmark=False
+DEVICE=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[Part 3 V10.1] Device: {DEVICE}")
+
+WD             = "/kaggle/working"
+TRAIN_SEQ    = f"{WD}/train_sequences_v10.csv"
+VAL_SEQ      = f"{WD}/val_sequences_v10.csv"
+TEST_SEQ     = f"{WD}/test_sequences_v10.csv"
+COFFEE_SEQ   = f"{WD}/coffee_sequences_v10.csv"
+PROG_PATH    = f"{WD}/best_prognosis_net_v10.pth"
+PROG_CKPT    = f"{WD}/checkpoint_prognosis_v10.pth"
+PROG_LOG     = f"{WD}/prognosis_train_log_v10.csv"
+PROG_METRICS = f"{WD}/prognosis_metrics_v10.csv"
+PROG_CURVE   = f"{WD}/prognosis_training_curves_v10.png"
+CONFORMAL    = f"{WD}/conformal_quantiles_v10.pkl"
+ROBUST_CSV   = f"{WD}/robustness_metrics_v10.csv"
+os.makedirs(WD, exist_ok=True)
+
+tr_seq = pd.read_csv(TRAIN_SEQ) if os.path.exists(TRAIN_SEQ) else pd.DataFrame()
+va_seq = pd.read_csv(VAL_SEQ)   if os.path.exists(VAL_SEQ)   else pd.DataFrame()
+te_seq = pd.read_csv(TEST_SEQ)  if os.path.exists(TEST_SEQ)  else pd.DataFrame()
+cf_seq = pd.read_csv(COFFEE_SEQ) if os.path.exists(COFFEE_SEQ) else pd.DataFrame()
+
+if len(tr_seq)==0: raise RuntimeError("No training sequences. Run Part 2 V10 first.")
+
+# V9: augmentation weight map
+AUG_WEIGHTS = {"base":1.0,"mixsev":0.7,"timewarp":0.7,"sevnoise":0.7}
+
+print(f"Sequences: train={len(tr_seq):,} val={len(va_seq):,} "
+      f"test={len(te_seq):,} coffee={len(cf_seq):,}")
+if "aug_method" in tr_seq.columns:
+    print(f"Train breakdown: {tr_seq.aug_method.value_counts().to_dict()}")
+    print(f"Aug weights: {AUG_WEIGHTS}")
+
+NUM_CROPS    = int(tr_seq.crop_idx.max())    + 1
+NUM_DISEASES = int(tr_seq.disease_idx.max()) + 1
+
+# ── Architecture ──────────────────────────────────────────────
+EMBED_DIM=512; MORPH_DIM=16; STAGE_EMB=8; CURVE_DIM=6; VEL_DIM=1
+CROP_EMB=32; DIS_EMB=32; SEQ_L=5; SEQ_P=3
+NUM_LV=6; CORAL_K=5; CONCEPT_DIM=CROP_EMB+DIS_EMB  # 64
+PROJ_DIM=256; TF_HEADS=4; LSTM_H=128; FB_ITER=2
+
+# V10.1: Compress vis_delta to 128 dimensions before concatenation
+VIS_DELTA_DIM = 128  # Was 512
+# vis(512) + vis_delta(128) + morph(16) + sev(1) + vel(1) + stage_emb(8) + curve(6) = 672
+SEQ_FEAT = EMBED_DIM + VIS_DELTA_DIM + MORPH_DIM + 1 + VEL_DIM + STAGE_EMB + CURVE_DIM
+
+LEVEL_NAMES=["L0","L1","L2","L3","L4","L5"]
+
+mnorm=[f"m_{c}" for c in ["lesion_fraction_image","lesion_fraction_bbox",
+       "bbox_fraction","bbox_aspect_ratio","bbox_diag_ratio","lesion_count",
+       "mean_area","max_area","std_area","median_area","area_cv","dispersion",
+       "density","compactness","entropy","convex_fraction"]]
+
+# Temporal masking probability (C2)
+TEMPORAL_MASK_PROB = 0.3
+
+# ── Training hyper-parameters ─────────────────────────────────
+PROG_BATCH   = 64
+GRAD_ACCUM   = 4            # effective batch = 256
+PROG_EPOCHS  = 80
+PROG_LR      = 5e-4
+PROG_WD      = 1e-4
+PATIENCE     = 20
+CONF_ALPHA   = 0.10         # 90% conformal coverage
+
+# ECE calibration bins
+ECE_BINS = 10
+
+# NLL sigma starts at exp(+0.5)=1.65 (uncertain, not overconfident)
+LOG_SIGMA = {"huber":0.0, "smooth":0.5, "tcr":0.5, "rank":1.0, "nll":0.5}
+
+print(f"SEQ_FEAT={SEQ_FEAT}  (V10.1: vis_delta compressed to {VIS_DELTA_DIM})")
+print(f"GRAD_ACCUM={GRAD_ACCUM}  EFF_BATCH={PROG_BATCH*GRAD_ACCUM}")
+print(f"NUM_CROPS={NUM_CROPS}  NUM_DISEASES={NUM_DISEASES}")
+print(f"TEMPORAL_MASK_PROB={TEMPORAL_MASK_PROB}")
+
+
+# ================================================================
+# LEARNED LOSS WEIGHTS (Kendall & Gal 2018)
+# ================================================================
+
+class LearnedWeights(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ls=nn.ParameterDict({
+            k:nn.Parameter(torch.tensor(v,dtype=torch.float32))
+            for k,v in LOG_SIGMA.items()})
+    def weighted(self,losses):
+        tot=torch.tensor(0.,device=list(losses.values())[0].device)
+        for n,l in losses.items():
+            s=self.ls[n]; tot=tot+torch.exp(-2.*s)*l+s
+        return tot
+    def report(self):
+        return {k:round(float(torch.exp(v).item()),4) for k,v in self.ls.items()}
+
+
+# ================================================================
+# MODEL COMPONENTS
+# ================================================================
+
+class SinPE(nn.Module):
+    def __init__(self,d,mx=64):
+        super().__init__()
+        pe=torch.zeros(mx,d); pos=torch.arange(mx).unsqueeze(1).float()
+        div=torch.exp(torch.arange(0,d,2).float()*(-math.log(10000.)/d))
+        pe[:,0::2]=torch.sin(pos*div); pe[:,1::2]=torch.cos(pos*div)
+        self.register_buffer("pe",pe.unsqueeze(0))
+    def forward(self,x): return x+self.pe[:,:x.size(1),:]
+
+class ARM(nn.Module):
+    def __init__(self,d,r=4):
+        super().__init__(); r=max(d//r,8)
+        self.fc=nn.Sequential(nn.Linear(d,r),nn.ReLU(),nn.Linear(r,d),nn.Sigmoid())
+    def forward(self,x): return x*self.fc(x)
+
+class CBAM1D(nn.Module):
+    def __init__(self,d,r=8):
+        super().__init__(); r=max(d//r,8)
+        self.mlp=nn.Sequential(nn.Linear(1,r),nn.ReLU(),nn.Linear(r,d))
+        self.sig=nn.Sigmoid()
+    def forward(self,x):
+        avg=x.mean(dim=1,keepdim=True); mx=x.max(dim=1,keepdim=True)[0]
+        return x*self.sig(self.mlp(avg)+self.mlp(mx))
+
+class eSTA(nn.Module):
+    def __init__(self,d):
+        super().__init__()
+        self.W=nn.Linear(d,d); self.v=nn.Linear(d,1,bias=False)
+    def forward(self,h):
+        a=torch.softmax(self.v(torch.tanh(self.W(h))),dim=1)
+        return (h*a).sum(1),a.squeeze(-1)
+
+class CORALHead(nn.Module):
+    def __init__(self,in_dim,K=CORAL_K):
+        super().__init__()
+        self.trunk=nn.Sequential(nn.Linear(in_dim,64),nn.GELU())
+        self.fc=nn.Linear(64,1,bias=False); self.bias=nn.Parameter(torch.zeros(K)); self.K=K
+    def forward(self,x):
+        return torch.sigmoid(self.fc(self.trunk(x))+self.bias.unsqueeze(0))
+    def coral_loss(self,probs,target_lv):
+        lv=target_lv.unsqueeze(1).float()
+        k=torch.arange(self.K,device=probs.device).float()
+        return F.binary_cross_entropy(probs,(lv>k).float())
+
+
+# ================================================================
+# PROGNOSISNET V10.1
+# ================================================================
+
+class PrognosisNetV10(nn.Module):
+    """
+    V10.1 additions over V10:
+      - Compressed vis_delta via delta_proj to 128 dimensions.
+      - Removed post-hoc apply_monotonic_correction from official metrics.
+    """
+    def __init__(self):
+        super().__init__()
+        assert SEQ_FEAT == EMBED_DIM + VIS_DELTA_DIM + MORPH_DIM + 1 + VEL_DIM + STAGE_EMB + CURVE_DIM, \
+            f"SEQ_FEAT mismatch: expected {EMBED_DIM+VIS_DELTA_DIM+MORPH_DIM+1+VEL_DIM+STAGE_EMB+CURVE_DIM}, got {SEQ_FEAT}"
+        self.pred_len=SEQ_P; self.fb_iter=FB_ITER
+        self.crop_emb=nn.Embedding(NUM_CROPS,   CROP_EMB)
+        self.dis_emb =nn.Embedding(NUM_DISEASES,DIS_EMB)
+        self.lv_emb  =nn.Embedding(NUM_LV,      STAGE_EMB)
+        nn.init.normal_(self.crop_emb.weight,std=0.01)
+        nn.init.normal_(self.dis_emb.weight, std=0.01)
+        nn.init.normal_(self.lv_emb.weight,  std=0.01)
+        
+        # V10.1: Project vis_delta down to 128 to reduce noise
+        self.delta_proj = nn.Sequential(
+            nn.Linear(EMBED_DIM, VIS_DELTA_DIM),
+            nn.LayerNorm(VIS_DELTA_DIM),
+            nn.GELU()
+        )
+        
+        self.concept_proj=nn.Sequential(nn.Linear(CONCEPT_DIM,PROJ_DIM),nn.LayerNorm(PROJ_DIM))
+        self.inp_proj=nn.Sequential(nn.Linear(SEQ_FEAT,PROJ_DIM),nn.LayerNorm(PROJ_DIM))
+        self.pe=SinPE(PROJ_DIM)
+        # Cross-attention (query=last_t, memory=full_seq)
+        self.cross_attn=nn.TransformerDecoderLayer(
+            d_model=PROJ_DIM,nhead=TF_HEADS,
+            dim_feedforward=PROJ_DIM*4,dropout=0.1,
+            batch_first=True,norm_first=True)
+        self.bilstm=nn.LSTM(PROJ_DIM,LSTM_H,1,batch_first=True,bidirectional=True)
+        lstm_out=LSTM_H*2; fused=lstm_out+CONCEPT_DIM  # 320
+        self.esta    =eSTA(lstm_out)
+        self.arm     =ARM(fused); self.cbam=CBAM1D(fused)
+        self.bn_fused=nn.BatchNorm1d(fused)
+        self.fb_proj =nn.Linear(SEQ_P,fused)
+        self.fb_gate =nn.Linear(fused*2,fused)
+        self.mu_head =nn.Sequential(nn.Linear(fused,128),nn.GELU(),
+                                     nn.Linear(128,SEQ_P),nn.Sigmoid())
+        self.lv_head =nn.Sequential(nn.Linear(fused,128),nn.GELU(),
+                                     nn.Linear(128,SEQ_P))
+        # Horizon-aware uncertainty (per prediction step)
+        self.horizon_scale=nn.Parameter(torch.zeros(SEQ_P))
+        # CORAL ordinal level head per prediction step
+        self.coral_heads=nn.ModuleList([CORALHead(fused) for _ in range(SEQ_P)])
+
+    def _project(self, vis, vis_delta, morph, sev, vel, lvl, curve, ctx):
+        """V10.1: Compresses vis_delta and concatenates into sequence features."""
+        le = self.lv_emb(lvl)
+        vis_delta_comp = self.delta_proj(vis_delta)
+        x = torch.cat([vis, vis_delta_comp, morph, sev, vel, le, curve], dim=-1)
+        x = self.inp_proj(x); x = self.pe(x)
+        return x + self.concept_proj(ctx).unsqueeze(1)
+
+    def forward(self, vis, vis_delta, morph, sev, vel, lvl, curve, ci, di):
+        c=self.crop_emb(ci); d=self.dis_emb(di); ctx=torch.cat([c,d],dim=1)
+        x=self._project(vis, vis_delta, morph, sev, vel, lvl, curve, ctx)
+        last=x[:,-1:,:]; attended=self.cross_attn(tgt=last,memory=x)
+        lstm_out,_=self.bilstm(x)
+        lstm_out=lstm_out+attended.expand(-1,SEQ_L,-1)[:,:,:lstm_out.size(-1)]
+        z_ctx,attn_w=self.esta(lstm_out)
+        z=torch.cat([z_ctx,ctx],dim=1)
+        z=self.bn_fused(z); z=self.arm(z); z=self.cbam(z)
+        mu=self.mu_head(z)
+        for _ in range(self.fb_iter):
+            fb=self.fb_proj(mu); gate=torch.sigmoid(self.fb_gate(torch.cat([z,fb],1)))
+            z=z+gate*fb; mu=self.mu_head(z)
+        lv=self.lv_head(z)+self.horizon_scale.unsqueeze(0)
+        coral_probs=[self.coral_heads[p](z) for p in range(SEQ_P)]
+        return mu, lv, coral_probs, attn_w
+
+
+# ================================================================
+# LOSS (V9/V10: per-sample augmentation weight)
+# ================================================================
+
+def prognosis_loss(mu, lv, coral_probs, target, lw, coral_heads, sample_weights=None):
+    """
+    V9/V10: sample_weights (B,) multiplies the per-sample Huber loss.
+    Augmented sequences receive weight 0.7, base sequences 1.0.
+    """
+    hub_per = F.huber_loss(mu, target, delta=0.1, reduction="none").mean(1)  # (B,)
+    if sample_weights is not None:
+        hub = (hub_per * sample_weights).mean()
+    else:
+        hub = hub_per.mean()
+    smooth = (mu[:,1:]-mu[:,:-1]).abs().mean() if mu.size(1)>1 else torch.tensor(0.,device=mu.device)
+    tcr    = F.relu(mu[:,:-1]-mu[:,1:]+0.02).mean() if mu.size(1)>1 else torch.tensor(0.,device=mu.device)
+    rank   = torch.tensor(0.,device=mu.device)
+    if mu.size(1)>1:
+        for t in range(mu.size(1)-1):
+            s=torch.sign(target[:,t+1]-target[:,t])
+            rank=rank+F.relu(0.05-s*(mu[:,t+1]-mu[:,t])).mean()
+        rank=rank/(mu.size(1)-1)
+    var = torch.exp(lv).clamp(min=1e-6)
+    nll = (0.5*((target-mu)**2/var+lv)).mean()
+    total = lw.weighted({"huber":hub,"smooth":smooth,"tcr":tcr,"rank":rank,"nll":nll})
+    thr = torch.tensor([0.05,0.20,0.40,0.60,0.80], device=mu.device)
+    for p, cp in enumerate(coral_probs):
+        tgt_lv = torch.bucketize(target[:,p].detach(), thr).clamp(0, NUM_LV-1)
+        total = total + 0.10*coral_heads[p].coral_loss(cp, tgt_lv)/SEQ_P
+    return total, hub.item(), tcr.item(), rank.item(), nll.item()
+
+
+# ================================================================
+# SEQUENCE DATASET (V10: vis_delta + temporal masking)
+# ================================================================
+
+class SeqDS(Dataset):
+    def __init__(self, df_, training=False):
+        self.df = df_.reset_index(drop=True)
+        self.training = training
+        T = SEQ_L
+        self.vis_k = [f"t{t}_vis_{i}" for t in range(T) for i in range(EMBED_DIM)]
+        self.mph_k = [f"t{t}_{c}"     for t in range(T) for c in mnorm]
+        self.sev_k = [f"t{t}_severity"   for t in range(T)]
+        self.vel_k = [f"t{t}_vel"        for t in range(T)]
+        self.lvl_k = [f"t{t}_level_idx"  for t in range(T)]
+        self.crv_k = [f"t{t}_curve_{i}"  for t in range(T) for i in range(CURVE_DIM)]
+        self.tgt_k = [f"tgt_sev_{p}"     for p in range(SEQ_P)]
+        for c in self.mph_k+self.crv_k+self.vel_k:
+            if c not in self.df.columns: self.df[c] = 0.
+        # V9/V10: per-sample weight from aug_method
+        if "aug_method" in self.df.columns:
+            self.weights = self.df["aug_method"].map(AUG_WEIGHTS).fillna(0.7).values.astype(np.float32)
+        else:
+            self.weights = np.ones(len(self.df), dtype=np.float32)
+
+    def __len__(self): return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        T = SEQ_L
+        vis  = row[self.vis_k].values.astype(np.float32).reshape(T, EMBED_DIM)
+        mph  = row[self.mph_k].values.astype(np.float32).reshape(T, MORPH_DIM)
+        sev  = row[self.sev_k].values.astype(np.float32).reshape(T, 1)
+        vel  = row[self.vel_k].values.astype(np.float32).reshape(T, 1)
+        lvl  = row[self.lvl_k].values.astype(np.int64)
+        crv  = row[self.crv_k].values.astype(np.float32).reshape(T, CURVE_DIM)
+        ci   = int(row.crop_idx); di = int(row.disease_idx)
+        tgt  = row[self.tgt_k].values.astype(np.float32)
+        w    = float(self.weights[idx])
+
+        # ── C1 (V10): Visual delta embeddings ──────────────────
+        vis_delta = np.zeros_like(vis)          # (T, EMBED_DIM), zeros at t=0
+        vis_delta[1:] = vis[1:] - vis[:-1]      # Δvis[t] = vis[t] - vis[t-1]
+
+        # ── C2 (V10): Temporal masking augmentation (training) ──
+        if self.training and random.random() < TEMPORAL_MASK_PROB:
+            tmask = random.randint(0, T - 1)
+            vis[tmask]   = 0.
+            mph[tmask]   = 0.
+            # Recompute delta at masked and following step
+            vis_delta[tmask] = 0.
+            if tmask + 1 < T:
+                vis_delta[tmask + 1] = vis[tmask + 1] - vis[tmask]  # vis[tmask]=0 now
+
+        return (torch.tensor(vis,       dtype=torch.float32),
+                torch.tensor(vis_delta, dtype=torch.float32),
+                torch.tensor(mph,       dtype=torch.float32),
+                torch.tensor(sev,       dtype=torch.float32),
+                torch.tensor(vel,       dtype=torch.float32),
+                torch.tensor(lvl,       dtype=torch.long),
+                torch.tensor(crv,       dtype=torch.float32),
+                torch.tensor(ci,        dtype=torch.long),
+                torch.tensor(di,        dtype=torch.long),
+                torch.tensor(tgt,       dtype=torch.float32),
+                torch.tensor(w,         dtype=torch.float32))
+
+
+# ================================================================
+# TRAINING
+# ================================================================
+
+def train_prognosis():
+    tr_ds = SeqDS(tr_seq, training=True)
+    va_ds = SeqDS(va_seq, training=False)
+    tr_ld = DataLoader(tr_ds, PROG_BATCH, shuffle=True,  num_workers=2,
+                       pin_memory=True, drop_last=True)
+    va_ld = DataLoader(va_ds, PROG_BATCH, shuffle=False, num_workers=2, pin_memory=True)
+    model = PrognosisNetV10().to(DEVICE)
+    lw    = LearnedWeights().to(DEVICE)
+    params = list(model.parameters()) + list(lw.parameters())
+    opt = torch.optim.AdamW(params, lr=PROG_LR, weight_decay=PROG_WD)
+    sch = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        opt, T_0=20, T_mult=2, eta_min=PROG_LR/100)
+    hub_fn = nn.HuberLoss(delta=0.1)
+    nmp = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n{'='*60}\nPrognosisNet V10.1")
+    print(f"  Params: {nmp:,}  Train: {len(tr_ds):,}  Val: {len(va_ds):,}")
+    print(f"  SEQ_FEAT={SEQ_FEAT} (vis_delta compressed to {VIS_DELTA_DIM})")
+    print(f"  GRAD_ACCUM={GRAD_ACCUM}  EFF_BATCH={PROG_BATCH*GRAD_ACCUM}")
+    print(f"  Aug weights: base=1.0  mixsev/timewarp/sevnoise=0.7")
+    print(f"  Temporal mask prob: {TEMPORAL_MASK_PROB}")
+    print(f"  Monotonic correction: OFF (evaluations let model learn naturally)")
+    print("="*60)
+    best_hub=1e9; best_state=None; pat=0; start=0; hist=[]
+    if os.path.exists(PROG_CKPT):
+        ck = torch.load(PROG_CKPT, map_location=DEVICE)
+        model.load_state_dict(ck["model"]); opt.load_state_dict(ck["opt"])
+        sch.load_state_dict(ck["sch"])
+        if "lw" in ck: lw.load_state_dict(ck["lw"])
+        start=ck["epoch"]; best_hub=ck["best_hub"]
+        best_state=ck.get("bst"); pat=ck["pat"]; hist=ck.get("hist",[])
+        print(f"[CKPT] Resumed ep{start}  best_hub={best_hub:.5f}")
+    t0 = time.time()
+    for ep in range(start, PROG_EPOCHS):
+        model.train(); lw.train(); tl=tc=tr_=tn=0.
+        opt.zero_grad()
+        for step, batch in enumerate(tqdm(tr_ld, desc=f"  ep{ep+1:03d}", leave=False)):
+            vis,vd,mph,sv,vel,lvl,crv,ci,di,tgt,w = [b.to(DEVICE) for b in batch]
+            mu, logv, coral_p, _ = model(vis, vd, mph, sv, vel, lvl, crv, ci, di)
+            loss, h_, tc_, r_, n_ = prognosis_loss(mu, logv, coral_p, tgt, lw,
+                                                    model.coral_heads,
+                                                    sample_weights=w)
+            (loss / GRAD_ACCUM).backward()
+            if (step+1) % GRAD_ACCUM == 0 or (step+1) == len(tr_ld):
+                nn.utils.clip_grad_norm_(model.parameters(), 1.)
+                opt.step(); opt.zero_grad()
+            tl+=loss.item(); tc+=tc_; tr_+=r_; tn+=n_
+        sch.step()
+        model.eval(); lw.eval(); vl=vh=0.
+        with torch.no_grad():
+            for batch in va_ld:
+                vis,vd,mph,sv,vel,lvl,crv,ci,di,tgt,w = [b.to(DEVICE) for b in batch]
+                mu, logv, coral_p, _ = model(vis, vd, mph, sv, vel, lvl, crv, ci, di)
+                # Removed hard monotonic correction to let model learn naturally
+                vl += prognosis_loss(mu, logv, coral_p, tgt, lw, model.coral_heads)[0].item()
+                vh += hub_fn(mu, tgt).item()
+        nt=len(tr_ld); nv=len(va_ld); vh_=vh/nv; sr=lw.report()
+        hs=model.horizon_scale.detach().cpu().tolist()
+        print(f"  ep{ep+1:03d}  tr={tl/nt:.4f}  tcr={tc/nt:.4f}  "
+              f"rank={tr_/nt:.4f}  va_hub={vh_:.5f}  lr={opt.param_groups[0]['lr']:.1e}")
+        print(f"         σ_nll={sr['nll']:.3f}  σ_hub={sr['huber']:.3f}  "
+              f"hs={[round(h,3) for h in hs]}")
+        row={"epoch":ep+1,"va_hub":vh_,"tr_loss":round(tl/nt,5),
+             **{f"sigma_{k}":v for k,v in sr.items()},
+             **{f"hs_{p}":round(hs[p],4) for p in range(SEQ_P)}}
+        hist.append(row); pd.DataFrame(hist).to_csv(PROG_LOG, index=False)
+        if vh_ < best_hub:
+            best_hub=vh_; best_state=copy.deepcopy(model.state_dict())
+            pat=0; torch.save(best_state, PROG_PATH)
+            print(f"  ✔ Best (hub={best_hub:.5f})")
+        else: pat+=1
+        torch.save({"epoch":ep+1,"model":model.state_dict(),"opt":opt.state_dict(),
+                    "sch":sch.state_dict(),"lw":lw.state_dict(),"best_hub":best_hub,
+                    "bst":best_state,"pat":pat,"hist":hist}, PROG_CKPT)
+        if pat >= PATIENCE: print(f"Early stop ep{ep+1}."); break
+    tt = time.time() - t0
+    best = PrognosisNetV10().to(DEVICE); best.load_state_dict(best_state)
+    print(f"\n✔ Saved → {PROG_PATH}  [{tt/60:.1f} min]")
+    return best, lw, tt
+
+
+# ================================================================
+# CONFORMAL CALIBRATION
+# ================================================================
+
+@torch.no_grad()
+def calibrate_conformal(model, va_df, alpha=CONF_ALPHA):
+    print(f"\n[C3] Conformal calibration ({1-alpha:.0%} coverage) …")
+    ds = SeqDS(va_df, training=False)
+    ld = DataLoader(ds, 64, shuffle=False, num_workers=2)
+    model.eval(); resids=[]
+    for batch in tqdm(ld, desc="  Calibration"):
+        vis,vd,mph,sv,vel,lvl,crv,ci,di,tgt,_ = [b.to(DEVICE) for b in batch]
+        mu,_,_,_ = model(vis, vd, mph, sv, vel, lvl, crv, ci, di)
+        # Removed apply_monotonic_correction
+        resids.append((mu - tgt).abs().cpu().numpy())
+    resids=np.concatenate(resids, axis=0); n=len(resids)
+    q_lvl=min((1-alpha)*(1+1/n), 1.0); q={}
+    for p in range(SEQ_P):
+        q[p]=float(np.quantile(resids[:,p], q_lvl))
+        print(f"  t+{p+1}: q_{1-alpha:.0%} = {q[p]:.4f}")
+    with open(CONFORMAL,"wb") as f: pickle.dump(q, f)
+    return q
+
+
+# ================================================================
+# UNCERTAINTY CALIBRATION METRICS (C4)
+# ================================================================
+
+def compute_ece(errors, sigmas, n_bins=ECE_BINS):
+    """
+    Expected Calibration Error for regression uncertainty.
+    Bins predictions by predicted confidence (normalized 1/sigma)
+    and measures calibration gap.
+    errors: (N, P)  absolute errors
+    sigmas: (N, P)  predicted std deviations
+    Returns: scalar ECE, per-step ECE list
+    """
+    per_step_ece = []
+    for p in range(errors.shape[1]):
+        e = errors[:, p]; s = sigmas[:, p]
+        # Normalize residuals
+        norm_e = e / (s + 1e-8)
+        # Bin by predicted sigma
+        bins = np.linspace(0, np.percentile(s, 98), n_bins + 1)
+        ece = 0.
+        for b in range(n_bins):
+            mask = (s >= bins[b]) & (s < bins[b+1])
+            if mask.sum() == 0: continue
+            avg_conf = 1. / (s[mask].mean() + 1e-8)
+            avg_err  = e[mask].mean()
+            ece += abs(avg_conf - 1./(avg_err + 1e-8)) * mask.sum() / len(e)
+        per_step_ece.append(round(float(ece), 5))
+    return round(float(np.mean(per_step_ece)), 5), per_step_ece
+
+
+def compute_uncertainty_error_corr(errors, sigmas):
+    """
+    Spearman correlation between predicted sigma and actual error.
+    A well-calibrated model should have positive correlation:
+    higher predicted uncertainty → higher actual error.
+    """
+    per_step = []
+    for p in range(errors.shape[1]):
+        try:
+            r, _ = spearmanr(sigmas[:, p], errors[:, p])
+            per_step.append(round(float(r), 4))
+        except:
+            per_step.append(0.)
+    return round(float(np.nanmean(per_step)), 4), per_step
+
+
+def compute_coverage_width(errors, sigmas, conf_q):
+    """
+    Coverage-width tradeoff: for the conformal intervals,
+    compute average width and actual coverage per step.
+    """
+    coverages, widths = [], []
+    for p in range(errors.shape[1]):
+        q = conf_q[p]
+        cov = float((errors[:, p] <= q).mean())
+        coverages.append(round(cov, 4))
+        widths.append(round(2 * q, 4))  # symmetric interval
+    return coverages, widths
+
+
+# ================================================================
+# EVALUATION (V10: + calibration metrics)
+# ================================================================
+
+def _to_lv(t):
+    thr = torch.tensor([0.05,0.20,0.40,0.60,0.80], device=t.device)
+    return torch.bucketize(t, thr).clamp(0, 5)
+
+
+@torch.no_grad()
+def evaluate(model, df_, split, conf_q=None):
+    if len(df_)==0: print(f"  [{split}] empty"); return {}
+    ds = SeqDS(df_, training=False)
+    ld = DataLoader(ds, 64, shuffle=False, num_workers=2)
+    model.eval()
+    all_mu=[]; all_lv=[]; all_tgt=[]; all_attn=[]
+    for batch in tqdm(ld, desc=f"  Eval {split}"):
+        vis,vd,mph,sv,vel,lvl,crv,ci,di,tgt,_ = [b.to(DEVICE) for b in batch]
+        mu, lv, _, aw = model(vis, vd, mph, sv, vel, lvl, crv, ci, di)
+        # Removed apply_monotonic_correction
+        all_mu.append(mu.cpu()); all_lv.append(lv.cpu())
+        all_tgt.append(tgt.cpu()); all_attn.append(aw.cpu())
+    mu  = torch.cat(all_mu)
+    lv  = torch.cat(all_lv)
+    tgt = torch.cat(all_tgt)
+    attn= torch.cat(all_attn).numpy()
+    var = torch.exp(lv).clamp(min=1e-6)
+    sigma_np = torch.exp(0.5 * lv).cpu().numpy()  # predicted std
+    errors_np= (mu - tgt).abs().cpu().numpy()
+
+    mae   = float((mu-tgt).abs().mean())
+    rmse  = float(((mu-tgt)**2).mean().sqrt())
+    hub   = float(nn.HuberLoss(delta=0.1)(mu, tgt))
+    nll   = float((0.5*((tgt-mu)**2/var+lv)).mean())
+    lacc  = float((_to_lv(mu)==_to_lv(tgt)).float().mean())
+    nmono = float(F.relu(mu[:,:-1]-mu[:,1:]).mean()) if mu.size(1)>1 else 0.
+    srl   = []
+    for i in range(min(len(mu), 500)):
+        try: srl.append(spearmanr(mu[i].numpy(), tgt[i].numpy())[0])
+        except: pass
+    msr   = float(np.nanmean(srl)) if srl else 0.
+    pmae  = (mu-tgt).abs().mean(0).tolist()
+    prmse = ((mu-tgt)**2).mean(0).sqrt().tolist()
+
+    # ── C4 (V10): Uncertainty calibration metrics ───────────────
+    ece, per_step_ece = compute_ece(errors_np, sigma_np)
+    ue_corr, per_step_ue_corr = compute_uncertainty_error_corr(errors_np, sigma_np)
+
+    conf_cov = None; conf_cov_widths = None
+    if conf_q:
+        covered=[]
+        for p in range(SEQ_P):
+            q=conf_q[p]; cov=float(((tgt[:,p]-mu[:,p]).abs()<=q).float().mean())
+            covered.append(round(cov,4))
+        conf_cov = covered
+        _, widths = compute_coverage_width(errors_np, sigma_np, conf_q)
+        conf_cov_widths = widths
+        print(f"  Conformal coverage: {covered} (target 90%)")
+
+    print(f"  ECE (calibration): {ece}  per-step: {per_step_ece}")
+    print(f"  UE-error corr    : {ue_corr}  per-step: {per_step_ue_corr}")
+    if conf_cov_widths:
+        print(f"  Conf interval widths: {conf_cov_widths}")
+
+    res = {"split":split,"MAE":round(mae,4),"RMSE":round(rmse,4),
+           "Huber":round(hub,4),"NLL":round(nll,4),"LevelAcc":round(lacc,4),
+           "NonMonoRate":round(nmono,4),"SpearmanR":round(msr,4),
+           "ECE":ece,"UE_ErrorCorr":ue_corr,
+           "per_step_MAE":[round(v,4) for v in pmae],
+           "per_step_RMSE":[round(v,4) for v in prmse],
+           "per_step_ECE":per_step_ece,
+           "per_step_UE_corr":per_step_ue_corr,
+           "n_sequences":int(len(mu))}
+    if conf_cov:
+        res["conformal_coverage"] = conf_cov
+    if conf_cov_widths:
+        res["conformal_widths"] = conf_cov_widths
+
+    print(f"\n{'='*50}\n{split.upper()}")
+    for k, v in res.items(): print(f"  {k:<26}: {v}")
+
+    # Save predictions
+    pred_rows=[]
+    for i in range(len(mu)):
+        ri = df_.iloc[i]
+        r = {"seq_id":ri.get("seq_id",i),"crop_disease":ri.get("crop_disease",""),
+             "aug_method":ri.get("aug_method","base"),"split":split}
+        for p in range(SEQ_P):
+            r[f"pred_sev_{p}"]   = round(float(mu[i,p]),4)
+            r[f"true_sev_{p}"]   = round(float(tgt[i,p]),4)
+            r[f"pred_sigma_{p}"] = round(float(sigma_np[i,p]),4)
+            if conf_q:
+                r[f"conf_q_{p}"] = round(conf_q[p],4)
+                r[f"conf_lo_{p}"]= round(float(mu[i,p])-conf_q[p],4)
+                r[f"conf_hi_{p}"]= round(float(mu[i,p])+conf_q[p],4)
+        r["attn_weights"]=list(np.round(attn[i],4))
+        pred_rows.append(r)
+    pd.DataFrame(pred_rows).to_csv(f"{WD}/predictions_{split}_v10.csv", index=False)
+    print(f"  → {WD}/predictions_{split}_v10.csv")
+    return res
+
+
+# ================================================================
+# ROBUSTNESS EVALUATION (C5)
+# ================================================================
+
+@torch.no_grad()
+def evaluate_robustness(model, df_, conf_q=None):
+    """
+    C5 (V10): Evaluate model under four corruption types.
+    Returns a DataFrame of MAE / LevelAcc degradation.
+    """
+    if len(df_) == 0:
+        print("  [Robustness] empty df, skipping.")
+        return pd.DataFrame()
+
+    print(f"\n{'='*60}\nROBUSTNESS EVALUATION (V10 C5)")
+    model.eval()
+
+    corruption_configs = [
+        ("clean",               None,  None),
+        ("sev_noise_σ0.05",     "sev", 0.05),
+        ("sev_noise_σ0.10",     "sev", 0.10),
+        ("mask_1_timestep",     "mask", 1),
+        ("mask_2_timesteps",    "mask", 2),
+        ("morph_noise_50pct",   "morph",0.5),
+        ("vis_lowres_top50pct", "vis",  0.5),
+    ]
+
+    rows=[]
+    for name, corrupt_type, corrupt_param in corruption_configs:
+        all_mu=[]; all_tgt=[]
+        # Re-create dataset without augmentation
+        ds_base = SeqDS(df_, training=False)
+        ld = DataLoader(ds_base, 64, shuffle=False, num_workers=2)
+
+        for batch in ld:
+            vis,vd,mph,sv,vel,lvl,crv,ci,di,tgt,_ = [b.to(DEVICE) for b in batch]
+
+            # Apply corruption
+            if corrupt_type == "sev":
+                noise = torch.randn_like(sv) * corrupt_param
+                sv = (sv + noise).clamp(0, 1)
+                # Recompute vel as Δsev
+                vel_new = torch.zeros_like(vel)
+                vel_new[:,1:] = sv[:,1:,0:1] - sv[:,:-1,0:1]
+                vel = vel_new
+            elif corrupt_type == "mask":
+                # Mask random timesteps
+                for b_idx in range(vis.size(0)):
+                    t_mask = random.sample(range(SEQ_L), min(corrupt_param, SEQ_L))
+                    for tm in t_mask:
+                        vis[b_idx, tm] = 0.
+                        mph[b_idx, tm] = 0.
+                # Recompute vis_delta
+                vd = torch.zeros_like(vd)
+                vd[:,1:] = vis[:,1:] - vis[:,:-1]
+            elif corrupt_type == "morph":
+                noise = torch.randn_like(mph) * mph.std() * corrupt_param
+                mph = mph + noise
+            elif corrupt_type == "vis":
+                # Zero top-k% of embedding dimensions (simulate low-res features)
+                k = int(EMBED_DIM * corrupt_param)
+                vis[:, :, :k] = 0.
+                vd = torch.zeros_like(vd); vd[:,1:] = vis[:,1:] - vis[:,:-1]
+
+            mu, _, _, _ = model(vis, vd, mph, sv, vel, lvl, crv, ci, di)
+            # Removed apply_monotonic_correction
+            all_mu.append(mu.cpu()); all_tgt.append(tgt.cpu())
+
+        mu_all  = torch.cat(all_mu)
+        tgt_all = torch.cat(all_tgt)
+        mae_v  = float((mu_all - tgt_all).abs().mean())
+        lacc_v = float((_to_lv(mu_all)==_to_lv(tgt_all)).float().mean())
+        rows.append({"corruption":name, "MAE":round(mae_v,4), "LevelAcc":round(lacc_v,4)})
+        print(f"  {name:<28} MAE={mae_v:.4f}  LevelAcc={lacc_v:.4f}")
+
+    rob_df = pd.DataFrame(rows)
+    rob_df.to_csv(ROBUST_CSV, index=False)
+    print(f"\nRobustness → {ROBUST_CSV}")
+    return rob_df
+
+
+# ================================================================
+# TRAINING CURVES
+# ================================================================
+
+def plot_curves():
+    if not os.path.exists(PROG_LOG): return
+    log = pd.read_csv(PROG_LOG)
+    sc = [c for c in log.columns if c.startswith("sigma_")]
+    hs = [c for c in log.columns if c.startswith("hs_")]
+    n  = 2 + (1 if sc else 0) + (1 if hs else 0)
+    fig, axes = plt.subplots(1, n, figsize=(6*n, 4))
+    if n==1: axes=[axes]
+    axes[0].plot(log.epoch, log.tr_loss, label="Train",      lw=1.5)
+    axes[0].plot(log.epoch, log.va_hub,  label="Val Huber",  lw=1.5, color="red")
+    axes[0].axhline(0.06, ls="--", color="green", lw=1.5, label="0.06 target")
+    axes[0].set_title("Loss"); axes[0].legend(); axes[0].grid(True,alpha=0.3); axes[0].set_xlabel("Epoch")
+    axes[1].plot(log.epoch, log.va_hub, color="red", lw=2)
+    axes[1].axhline(0.06, ls="--", color="green", lw=1.5)
+    axes[1].fill_between(log.epoch, 0, log.va_hub, alpha=0.1, color="red")
+    axes[1].set_title("Val Huber"); axes[1].grid(True,alpha=0.3); axes[1].set_xlabel("Epoch")
+    ax_idx=2
+    if sc and len(axes)>ax_idx:
+        for s in sc:
+            axes[ax_idx].plot(log.epoch, log[s], label=s.replace("sigma_","σ_"), lw=1.5)
+        axes[ax_idx].set_title("Learned σ (Kendall 2018)"); axes[ax_idx].legend(fontsize=7)
+        axes[ax_idx].grid(True,alpha=0.3); axes[ax_idx].set_xlabel("Epoch"); ax_idx+=1
+    if hs and len(axes)>ax_idx:
+        for h in hs:
+            axes[ax_idx].plot(log.epoch, log[h], label=h.replace("hs_","t+"), lw=1.5)
+        axes[ax_idx].set_title("Horizon scale"); axes[ax_idx].legend(fontsize=7)
+        axes[ax_idx].grid(True,alpha=0.3); axes[ax_idx].set_xlabel("Epoch")
+    plt.suptitle("PrognosisNet V10.1", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(PROG_CURVE, dpi=150, bbox_inches="tight"); plt.close()
+    print(f"Curves → {PROG_CURVE}")
+
+
+# ================================================================
+# MAIN
+# ================================================================
+
+if __name__=="__main__":
+    # Uncomment to force retrain:
+    # for _p in [PROG_PATH, PROG_CKPT]:
+    #    if os.path.exists(_p): os.remove(_p)
+
+    if os.path.exists(PROG_PATH):
+        print(f"\n[SKIP] Loading → {PROG_PATH}")
+        prog_model = PrognosisNetV10().to(DEVICE)
+        prog_model.load_state_dict(torch.load(PROG_PATH, map_location=DEVICE))
+        lw = LearnedWeights().to(DEVICE); train_time=0.
+    else:
+        prog_model, lw, train_time = train_prognosis()
+
+    if os.path.exists(CONFORMAL):
+        with open(CONFORMAL,"rb") as f: conf_q = pickle.load(f)
+        print(f"\n[C3] Conformal quantiles: {conf_q}")
+    else:
+        conf_q = calibrate_conformal(prog_model, va_seq, alpha=CONF_ALPHA)
+
+    print("\n[Part 3 V10.1] Evaluation …")
+    va_m = evaluate(prog_model, va_seq,  "val",             conf_q)
+    te_m = evaluate(prog_model, te_seq,  "test",            conf_q)
+    cf_m = evaluate(prog_model, cf_seq,  "coffee_interdom",conf_q) if len(cf_seq)>0 else {}
+
+    # C5: Robustness evaluation on test set
+    rob_df = evaluate_robustness(prog_model, te_seq, conf_q)
+
+    rows=[{"split":"val",**va_m},{"split":"test",**te_m}]
+    if cf_m: rows.append({"split":"coffee_interdom",**cf_m})
+    pd.DataFrame(rows).to_csv(PROG_METRICS, index=False)
+    print(f"\nMetrics → {PROG_METRICS}")
+    plot_curves()
+
+    print("\n"+"="*60+"\n✓  Part 3 V10.1 Complete\n"+"="*60)
+    print(f"  Model        → {PROG_PATH}")
+    print(f"  Conformal    → {CONFORMAL}")
+    print(f"  Metrics      → {PROG_METRICS}")
+    print(f"  Robustness   → {ROBUST_CSV}")
+    print(f"  Train time   → {train_time/60:.1f} min")
+    print(f"\n  Test results:")
+    print(f"    MAE          : {te_m.get('MAE','—')}")
+    print(f"    RMSE         : {te_m.get('RMSE','—')}")
+    print(f"    LevelAcc     : {te_m.get('LevelAcc','—')}")
+    print(f"    NonMonoRate  : {te_m.get('NonMonoRate','—')}")
+    print(f"    SpearmanR    : {te_m.get('SpearmanR','—')}")
+    print(f"    ECE          : {te_m.get('ECE','—')}")
+    print(f"    UE-ErrCorr   : {te_m.get('UE_ErrorCorr','—')}")
+    print(f"    Conf cov     : {te_m.get('conformal_coverage','—')}")
+    print(f"    Conf widths  : {te_m.get('conformal_widths','—')}")
+    if cf_m:
+        print(f"\n  Coffee inter-domain:")
+        print(f"    MAE          : {cf_m.get('MAE','—')}")
+        print(f"    LevelAcc     : {cf_m.get('LevelAcc','—')}")
+        print(f"    ECE          : {cf_m.get('ECE','—')}")
+    if len(rob_df)>0:
+        print(f"\n  Robustness (test MAE under corruption):")
+        for _, r in rob_df.iterrows():
+            print(f"    {r['corruption']:<28} MAE={r['MAE']}  LevelAcc={r['LevelAcc']}")
+    print(f"\n  Learned σ    : {lw.report()}")
+    print(f"\n  V10.1 vs V10 changes:")
+    print(f"    SEQ_FEAT     : {SEQ_FEAT} (vis_delta compressed to {VIS_DELTA_DIM})")
+    print(f"    Mono correct : OFF at evaluation (model learns it naturally)")
+    print("\nNext: python part4_v10.py")

@@ -1,0 +1,46 @@
+{
+  "source_notebook": "notebooks/version-v10.ipynb",
+  "cell_count": 8,
+  "stages": [
+    {
+      "cell": 0,
+      "script": "scripts/00_prognosis_master_builder_v10.py",
+      "lines": 423
+    },
+    {
+      "cell": 1,
+      "script": "scripts/01_research_grade_v10.py",
+      "lines": 1639
+    },
+    {
+      "cell": 2,
+      "script": "scripts/02_prognosisnet_v10.py",
+      "lines": 833
+    },
+    {
+      "cell": 3,
+      "script": "scripts/03_coffee_sequence_builder_v10.py",
+      "lines": 424
+    },
+    {
+      "cell": 4,
+      "script": "scripts/04_cross_domain_coffee_evaluation.py",
+      "lines": 363
+    },
+    {
+      "cell": 5,
+      "script": "scripts/05_baselines_ablations_v10.py",
+      "lines": 1319
+    },
+    {
+      "cell": 6,
+      "script": "scripts/06_elsevier_figure_generation.py",
+      "lines": 854
+    },
+    {
+      "cell": 7,
+      "script": "scripts/07_inventory_dataset_files.py",
+      "lines": 43
+    }
+  ]
+}
